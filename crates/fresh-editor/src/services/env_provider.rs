@@ -297,10 +297,10 @@ impl EnvProvider {
     }
 }
 
-/// Build the shell script the capture runs: `cd <dir>; <snippet>; command env`.
+/// Build the shell script the capture runs: `cd <dir>; <snippet>; command env -0`.
 /// The caller's `run` closure wraps this in the host's shell (`$SHELL -lc …`
-/// locally, `ssh … sh -lc …` remotely, etc.). `command env` prints the
-/// resulting environment, one `KEY=VALUE` per line.
+/// locally, `ssh … sh -lc …` remotely, etc.). NUL-delimited records preserve
+/// embedded newlines, including those in exported Bash function definitions.
 fn build_capture_script(snippet: &str, dir: Option<&Path>) -> String {
     let mut script = String::new();
     if let Some(d) = dir {
@@ -314,13 +314,13 @@ fn build_capture_script(snippet: &str, dir: Option<&Path>) -> String {
         script.push_str("; ");
     }
     // `command env` bypasses any `env` function/alias.
-    script.push_str("command env");
+    script.push_str("command env -0");
     script
 }
 
 /// Marker printed between the baseline and activated env dumps in the delta
-/// capture. A fixed, unlikely token — env values never legitimately contain it,
-/// so it cleanly splits the two halves of the output. `pub(crate)` so the SSH
+/// capture. Framed by NULs as a standalone record so occurrences inside env
+/// values cannot split the output. `pub(crate)` so the SSH
 /// remote launcher ([`crate::services::remote::spawner::ssh_remote_env_launcher`])
 /// can split on the identical marker when it captures the delta on the remote.
 pub(crate) const DELTA_SENTINEL: &str = "__FRESH_ENV_DELTA_SENTINEL_b3f1c2__";
@@ -338,7 +338,7 @@ fn build_delta_capture_script(snippet: &str, dir: Option<&Path>) -> String {
         script.push_str(&shell_quote(&d.to_string_lossy()));
         script.push_str("; ");
     }
-    script.push_str("command env; printf '%s\\n' ");
+    script.push_str("command env -0; printf '\\0%s\\0' ");
     script.push_str(&shell_quote(DELTA_SENTINEL));
     script.push_str("; ");
     let snippet = snippet.trim();
@@ -346,7 +346,7 @@ fn build_delta_capture_script(snippet: &str, dir: Option<&Path>) -> String {
         script.push_str(snippet);
         script.push_str("; ");
     }
-    script.push_str("command env");
+    script.push_str("command env -0");
     script
 }
 
@@ -358,7 +358,8 @@ fn build_delta_capture_script(snippet: &str, dir: Option<&Path>) -> String {
 /// appear. If the sentinel is missing (capture malformed), returns an empty
 /// delta rather than guessing.
 fn parse_delta(stdout: &str) -> EnvDelta {
-    let Some((baseline_text, activated_text)) = stdout.split_once(DELTA_SENTINEL) else {
+    let separator = format!("\0{DELTA_SENTINEL}\0");
+    let Some((baseline_text, activated_text)) = stdout.split_once(&separator) else {
         return EnvDelta::default();
     };
     let baseline = parse_env(baseline_text);
@@ -387,12 +388,12 @@ fn parse_delta(stdout: &str) -> EnvDelta {
     EnvDelta { set, unset }
 }
 
-/// Parse `env` output (`KEY=VALUE` lines) into pairs. Lines without `=` or with
+/// Parse `env -0` output (`KEY=VALUE` records) into pairs. Records without `=` or with
 /// an empty key are skipped. A value may itself contain `=`; only the first is
-/// the separator. (Values with embedded newlines — rare — are not handled.)
+/// the separator. Newlines and carriage returns are preserved verbatim.
 fn parse_env(stdout: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for line in stdout.lines() {
+    for line in stdout.split('\0') {
         if let Some(eq) = line.find('=') {
             if eq == 0 {
                 continue;
@@ -542,12 +543,12 @@ mod tests {
     fn build_capture_script_shapes() {
         assert_eq!(
             build_capture_script("source .venv/bin/activate", Some(Path::new("/a b"))),
-            "cd '/a b'; source .venv/bin/activate; command env"
+            "cd '/a b'; source .venv/bin/activate; command env -0"
         );
-        assert_eq!(build_capture_script("", None), "command env");
+        assert_eq!(build_capture_script("", None), "command env -0");
         assert_eq!(
             build_capture_script(r#"eval "$(direnv export bash)""#, None),
-            r#"eval "$(direnv export bash)"; command env"#
+            r#"eval "$(direnv export bash)"; command env -0"#
         );
     }
 
@@ -557,15 +558,15 @@ mod tests {
         assert_eq!(
             s,
             format!(
-                "cd '/p'; command env; printf '%s\\n' '{DELTA_SENTINEL}'; \
-                 source .venv/bin/activate; command env"
+                "cd '/p'; command env -0; printf '\\0%s\\0' '{DELTA_SENTINEL}'; \
+                 source .venv/bin/activate; command env -0"
             )
         );
     }
 
     #[test]
     fn parse_env_basics() {
-        let out = "PATH=/a:/b\nVIRTUAL_ENV=/p/.venv\nWEIRD=a=b=c\n=skipme\nnoeq\n";
+        let out = "PATH=/a:/b\0VIRTUAL_ENV=/p/.venv\0WEIRD=a=b=c\0=skipme\0noeq\0EMPTY=\0";
         let vars = parse_env(out);
         assert_eq!(
             vars,
@@ -573,8 +574,61 @@ mod tests {
                 ("PATH".to_string(), "/a:/b".to_string()),
                 ("VIRTUAL_ENV".to_string(), "/p/.venv".to_string()),
                 ("WEIRD".to_string(), "a=b=c".to_string()),
+                ("EMPTY".to_string(), "".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_env_preserves_multiline_values() {
+        let function = "() {  if [ -n \"example\" ]; then\n echo example;\n fi\n}";
+        let vars = parse_env(&format!(
+            "BASH_FUNC_show_devshell_name%%={function}\0TEXT=first\nFAKE=value\r\nlast\n\0"
+        ));
+        assert_eq!(
+            vars,
+            vec![
+                ("BASH_FUNC_show_devshell_name%%".into(), function.into()),
+                ("TEXT".into(), "first\nFAKE=value\r\nlast\n".into()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_bash_function_can_be_imported_by_a_child() {
+        let p = EnvProvider::inactive();
+        p.set(
+            "show_devshell_name() { if [ -n example ]; then\n echo example;\n fi;\n }; \
+             export -f show_devshell_name; export FRESH_MULTILINE='first\nFAKE=value\n'"
+                .into(),
+            None,
+        );
+        let run = |script: String| {
+            let output = std::process::Command::new("bash")
+                .args(["--noprofile", "--norc", "-c", &script])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            Some(String::from_utf8(output.stdout).unwrap())
+        };
+        let vars = p.current(|script| std::future::ready(run(script))).await;
+        let delta = p.capture_delta_blocking(run);
+        for env in [vars, delta.set] {
+            let output = std::process::Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    "show_devshell_name; printf '%s' \"$FRESH_MULTILINE\"",
+                ])
+                .envs(env)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            assert!(output.stderr.is_empty(), "{:?}", output);
+            assert_eq!(output.stdout, b"example\nfirst\nFAKE=value\n");
+        }
     }
 
     #[tokio::test]
@@ -600,7 +654,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let run = || {
             calls.set(calls.get() + 1);
-            async { Some("FOO=bar\nPATH=/x\n".to_string()) }
+            async { Some("FOO=bar\0PATH=/x\0".to_string()) }
         };
 
         let v1 = p.current(|_s| run()).await;
@@ -643,7 +697,7 @@ mod tests {
 
     /// Build a delta-capture stdout from a baseline and an activated env block.
     fn delta_output(baseline: &str, activated: &str) -> String {
-        format!("{baseline}\n{DELTA_SENTINEL}\n{activated}")
+        format!("{baseline}\0{DELTA_SENTINEL}\0{activated}")
     }
 
     #[test]
@@ -651,8 +705,8 @@ mod tests {
         // baseline → activated: PATH changed, VIRTUAL_ENV added, GONE removed,
         // HOME unchanged (must diff out), SHLVL unchanged (volatile diffs out).
         let out = delta_output(
-            "HOME=/h\nPATH=/usr/bin\nGONE=1\nSHLVL=3",
-            "HOME=/h\nPATH=/p/.venv/bin:/usr/bin\nVIRTUAL_ENV=/p/.venv\nSHLVL=3",
+            "HOME=/h\0PATH=/usr/bin\0GONE=1\0SHLVL=3",
+            "HOME=/h\0PATH=/p/.venv/bin:/usr/bin\0VIRTUAL_ENV=/p/.venv\0SHLVL=3",
         );
         let d = parse_delta(&out);
         assert_eq!(
@@ -667,7 +721,15 @@ mod tests {
 
     #[test]
     fn parse_delta_missing_sentinel_is_empty() {
-        assert!(parse_delta("HOME=/h\nPATH=/usr/bin").is_empty());
+        assert!(parse_delta("HOME=/h\0PATH=/usr/bin\0").is_empty());
+    }
+
+    #[test]
+    fn parse_delta_ignores_sentinel_inside_a_value() {
+        let unchanged = format!("TEXT=first\n{DELTA_SENTINEL}\nlast\0");
+        let d = parse_delta(&delta_output(&unchanged, &format!("{unchanged}NEW=a\nb\0")));
+        assert_eq!(d.set, vec![("NEW".into(), "a\nb".into())]);
+        assert!(d.unset.is_empty());
     }
 
     #[test]
@@ -676,7 +738,7 @@ mod tests {
         let ran = std::cell::Cell::new(false);
         let d = p.capture_delta_blocking(|_script| {
             ran.set(true);
-            Some(delta_output("A=1", "A=1\nB=2"))
+            Some(delta_output("A=1", "A=1\0B=2"))
         });
         assert!(d.is_empty());
         assert!(!ran.get(), "delta capture must not run when inactive");
@@ -691,7 +753,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let run = || {
             calls.set(calls.get() + 1);
-            Some(delta_output("PATH=/usr/bin", "PATH=/usr/bin\nFOO=bar"))
+            Some(delta_output("PATH=/usr/bin", "PATH=/usr/bin\0FOO=bar"))
         };
 
         let d1 = p.capture_delta_blocking(|_s| run());

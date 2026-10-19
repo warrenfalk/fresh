@@ -1109,21 +1109,21 @@ pub fn ssh_remote_env_launcher(recipe: &str) -> String {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     let recipe_json = serde_json::to_string(recipe).unwrap_or_else(|_| "\"\"".to_string());
-    // NB: the Rust raw string is the *python source*. `\\n` here is two chars
-    // (backslash, n) in the source, which python parses to a single `\n` for
-    // `printf` to turn into a newline. `{{` / `}}` are literal braces.
+    // NB: the Rust raw string is the *python source*. `\\0` lets printf emit
+    // NUL record delimiters without putting NULs in the shell script.
+    // `{{` / `}}` are literal braces.
     let launcher_src = format!(
         r#"import os,subprocess
 _r={recipe_json}
-_S="{sentinel}"
-_script="command env; printf '%s\\n' '"+_S+"'; "+_r+"; command env"
+_S="\0{sentinel}\0"
+_script="command env -0; printf '\\0%s\\0' '{sentinel}'; "+_r+"; command env -0"
 try:
     _o=subprocess.run(["bash","-lc",_script],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout.decode("utf-8","replace")
 except Exception:
     _o=""
 def _p(t):
     d={{}}
-    for ln in t.splitlines():
+    for ln in t.split("\0"):
         i=ln.find("=")
         if i>0: d[ln[:i]]=ln[i+1:]
     return d
@@ -1708,6 +1708,44 @@ mod tests {
             !inner.contains('\''),
             "recipe quotes must be base64-encapsulated, never leak into the literal"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_launcher_preserves_multiline_environment_values() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = tmp.path().join("shell");
+        // Stand in for the final login shell and report exactly the env passed
+        // by the generated launcher, without requiring an SSH host.
+        std::fs::write(
+            &shell,
+            "#!/usr/bin/env python3\nimport os\nos.execvp('env', ['env', '-0'])\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = ssh_remote_env_launcher(
+            "show_devshell_name() { if [ -n example ]; then\n echo example;\n fi;\n }; \
+             export -f show_devshell_name; export FRESH_MULTILINE='first\nFAKE=value\n'",
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &launcher])
+            .env("SHELL", &shell)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stderr.is_empty(), "{:?}", output);
+        let env = String::from_utf8(output.stdout).unwrap();
+        let records: Vec<_> = env.split('\0').collect();
+        assert!(records.contains(&"FRESH_MULTILINE=first\nFAKE=value\n"));
+        let function = records
+            .iter()
+            .find(|record| record.starts_with("BASH_FUNC_show_devshell_name%%="))
+            .expect("exported function");
+        assert!(function.contains('\n'));
+        assert!(function.ends_with('}'));
+        assert!(!records.contains(&"FAKE=value"));
     }
 
     /// Regression for #2584: the SSH integrated terminal broke when the remote
